@@ -1,148 +1,129 @@
-# -*- coding: utf-8 -*-
-import os
-import sys
+from torch.utils.data import Dataset
 import cv2
-import torch
-import time  # ≤π…œ¡À’‚∏ˆπÿº¸µƒ import
+import os
+import glob
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from turbojpeg import TurboJPEG
-
-# «ø÷∆ CPU ƒ£ Ω£¨πÊ±‹ Docker ª∑æ≥œ¬µƒ EGL ±®¥Ì
-os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
-os.environ['MEDIAPIPE_DISABLE_GPU'] = '1'
-
-# ================= HACK: MediaPipe Hidden Path =================
-try:
-    import mediapipe as mp
-    mp_root = mp.__path__[0]
-    hidden_path = os.path.join(mp_root, 'python')
-    if hidden_path not in sys.path:
-        sys.path.append(hidden_path)
-    
-    from solutions import face_mesh as mp_face_mesh
-    print(">>> [Path Hack] MediaPipe Solutions loaded successfully")
-except Exception as e:
-    print(f">>> MediaPipe loading failed: {e}")
-    sys.exit(1)
-
-# ================= Configuration =================
-DATA_ROOT = '/remote-home/images/lip_images'
-ANNO_ALL = '/remote-home/project/info/all_audio_video.txt'
-INFO_DIR = '/remote-home/project/info/'
-OUTPUT_DIR = '/remote-home/LRW1000_Processed_PKL/'
-
-LIPS_INDICES = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 308, 324, 
-                318, 402, 317, 14, 87, 178, 88, 95, 185, 40, 39, 37, 0, 267, 
-                269, 270, 409, 415, 310, 311, 312, 13, 82, 81, 80, 191, 78]
+import random
+import torch
+from collections import defaultdict
+import sys
+from torch.utils.data import DataLoader
+from turbojpeg import TurboJPEG, TJPF_GRAY, TJSAMP_GRAY, TJFLAG_PROGRESSIVE
 
 jpeg = TurboJPEG()
 
 class LRW1000_Dataset(Dataset):
-    def __init__(self, index_file, target_dir, global_pinyins):
+    
+    def __init__(self, index_file, target_dir):
+        
         self.data = []
+        self.index_file = index_file
         self.target_dir = target_dir
-        self.pinyins = global_pinyins
+        lines = []
+
+        with open(index_file, 'r') as f:
+            lines.extend([line.strip().split(',') for line in f.readlines()])
+        
+        self.data_root = '/share/home/dwj/learn-an-effective-lip-reading-model-without-pains/data_ori/lip_images'
         self.padding = 40
-        self.face_mesh = None 
 
-        if not os.path.exists(index_file):
-            print(f"!!! Error: {index_file} missing")
-            return
-
-        with open(index_file, 'r', encoding='utf-8') as f:
-            lines = [line.strip().split(',') for line in f.readlines()]
+        pinyins = sorted(np.unique([line[2] for line in lines]))
+        self.data = [(line[0], int(float(line[3])*25)+1, int(float(line[4])*25)+1, pinyins.index(line[2])) for line in lines]
+        max_len = max([data[2]-data[1] for data in self.data])
+        data = list(filter(lambda data: data[2]-data[1] <= self.padding, self.data))                
+        self.lengths = [data[2]-data[1] for data in self.data]
+        self.pinyins = pinyins
         
-        for line in lines:
-            if len(line) < 5: continue
-            folder, pinyin, op, ed = line[0], line[2], line[3], line[4]
-            try:
-                op_f, ed_f = int(float(op)*25)+1, int(float(ed)*25)+1
-                if pinyin in self.pinyins:
-                    label = self.pinyins.index(pinyin)
-                    self.data.append((folder, op_f, ed_f, label))
-            except: continue
-        print(f">>> Dataset initialized: {len(self.data)} samples.")
+        self.class_dict = defaultdict(list)
+        for item in data:
+            item = (item[0], None, item[1], item[2], item[3])                                
+            self.class_dict[item[-1]].append(item)                
 
-    def load_images(self, path, op, ed):
-        if self.face_mesh is None:
-            self.face_mesh = mp_face_mesh.FaceMesh(
-                static_image_mode=True, 
-                max_num_faces=1,
-                min_detection_confidence=0.5
-            )
+        self.data = []            
+        self.unlabel_data = []
+        for k, v in self.class_dict.items():
+            n = len(v) 
+            self.data.extend(v[:n])            
 
-        center = (op + ed) // 2
-        start_frame = center - self.padding // 2
+    def __len__(self):
+        return len(self.data)
+
+    def load_video(self, item):
+        (path, mfcc, op, ed, label) = item
+        inputs, border = self.load_images(os.path.join(self.data_root, path), op, ed)        
+                
+        result = {}        
+        result['video'] = inputs
+        result['label'] = int(label)        
+        result['duration'] = border.astype(bool) 
         
-        anchor_path = os.path.join(path, f'{center}.jpg')
-        if not os.path.exists(anchor_path):
-            files = sorted([f for f in os.listdir(path) if f.endswith('.jpg')])
-            if not files: return None
-            anchor_path = os.path.join(path, files[len(files)//2])
-
-        img = cv2.imread(anchor_path)
-        if img is None: return None
-        h, w, _ = img.shape
+        savename = os.path.join(self.target_dir, f'{path}_{op}_{ed}.pkl')
         
-        results = self.face_mesh.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        box = [int(h*0.5), int(h*0.8), int(w*0.3), int(w*0.7)]
+        os.makedirs(os.path.dirname(savename), exist_ok=True)
+        torch.save(result, savename)
         
-        if results.multi_face_landmarks:
-            lms = results.multi_face_landmarks[0].landmark
-            pts = np.array([(lms[i].x * w, lms[i].y * h) for i in LIPS_INDICES])
-            min_x, min_y = np.min(pts, axis=0)
-            max_x, max_y = np.max(pts, axis=0)
-            box = [int(min_y - 20), int(max_y + 20), int(min_x - 20), int(max_x + 20)]
-
-        processed = []
-        for i in range(start_frame, start_frame + self.padding):
-            p = os.path.join(path, f'{i}.jpg')
-            if os.path.exists(p):
-                frame = cv2.imread(p)
-                crop = frame[max(0,box[0]):min(h,box[1]), max(0,box[2]):min(w,box[3])]
-                crop = cv2.resize(crop, (112, 112))
-            else:
-                crop = np.zeros((112, 112, 3), dtype=np.uint8)
-            processed.append(jpeg.encode(crop))
-        return processed
-
-    def __len__(self): return len(self.data)
+        return True
 
     def __getitem__(self, idx):
-        try:
-            folder, op, ed, label = self.data[idx]
-            inputs = self.load_images(os.path.join(DATA_ROOT, folder), op, ed)
-            if inputs is None: return False
-            
-            # –ﬁ’˝¡À±‰¡ø√˚≤ªÕ≥“ªµƒŒ Ã‚
-            save_path = os.path.join(self.target_dir, f"{folder}_{op}_{ed}.pkl")
-            torch.save({'video': inputs, 'label': label}, save_path)
-            return True
-        except: return False
+        r = self.load_video(self.data[idx])
+        return r
 
-if __name__ == '__main__':
-    print("Step 1: Building global dictionary...")
-    with open(ANNO_ALL, 'r', encoding='utf-8') as f:
-        pinyins = [l.strip().split(',')[3] for l in f.readlines() if len(l.split(',')) >= 4]
-        global_pinyins = sorted(list(set(pinyins)))
+    def load_images(self, path, op, ed):
+        center = (op + ed) / 2
+        length = (ed - op + 1)
+        
+        op = int(center - self.padding // 2)
+        ed = int(op + self.padding)
+        left_border = max(int(center - length / 2 - op), 0)
+        right_border = min(int(center + length / 2 - op), self.padding)
+        
+        files =  [os.path.join(path, '{}.jpg'.format(i)) for i in range(op, ed)]
+        files = filter(lambda path: os.path.exists(path), files)
+        files = [cv2.imread(file) for file in files]
+        files = [cv2.resize(file, (96, 96)) for file in files]        
+        
+        files = np.stack(files, 0)        
+        t = files.shape[0]
+        
+        tensor = np.zeros((40, 96, 96, 3)).astype(files.dtype)
+        border = np.zeros((40))
+        tensor[:t,...] = files.copy()
+        border[left_border:right_border] = 1.0
+        
+        tensor = [jpeg.encode(tensor[_]) for _ in range(40)]
+        
+        return tensor, border
+
+
+if(__name__ == '__main__'):
     
-    WORKERS = 16 
-
+    label_files = {
+        'trn': '/share/home/dwj/learn-an-effective-lip-reading-model-without-pains/labels/trn_1000.txt',
+        'val': '/share/home/dwj/learn-an-effective-lip-reading-model-without-pains/labels/val_1000.txt',
+        'tst': '/share/home/dwj/learn-an-effective-lip-reading-model-without-pains/labels/tst_1000.txt'
+    }
+    
     for subset in ['trn', 'val', 'tst']:
-        target = os.path.join(OUTPUT_DIR, subset)
-        os.makedirs(target, exist_ok=True)
-        
-        ds = LRW1000_Dataset(os.path.join(INFO_DIR, f'{subset}_1000.txt'), target, global_pinyins)
-        if len(ds) == 0: continue
+        target_dir = f'LRW1000_Public_pkl_jpeg/{subset}'
+        index_file = label_files[subset]
 
-        loader = DataLoader(ds, batch_size=1, num_workers=WORKERS, shuffle=False)
+        if not os.path.exists(index_file):
+            print(f"Ë≠¶ÂëäÔºöÊú™ÊâæÂà∞Ê†áÁ≠æÊñá‰ª∂ {index_file}ÔºåË∑≥ËøáËØ•Â≠êÈõÜ„ÄÇ")
+            continue
+
+        if not os.path.exists(target_dir):
+            os.makedirs(target_dir, exist_ok=True)    
         
-        print(f"\n>>> Processing [{subset}] with {WORKERS} workers...")
-        start_t = time.time()
+        print(f"Ê≠£Âú®ÂêØÂä®Â§öËøõÁ®ãÂä†ËΩΩÂô®ÔºåÈ¢ÑÂ§ÑÁêÜÂ≠êÈõÜÔºö[{subset}]")
+        loader = DataLoader(LRW1000_Dataset(index_file, target_dir),
+                batch_size = 96, 
+                num_workers = 16,   
+                shuffle = False,         
+                drop_last = False)
         
-        for i, _ in enumerate(loader):
-            if i % 100 == 0 and i > 0:
-                elapsed = time.time() - start_t
-                eta = (elapsed / i) * (len(ds) - i) / 3600
-                print(f"[{subset}] Processed: {i}/{len(ds)} | ETA: {eta:.2f}h")
+        import time
+        tic = time.time()
+        for i, batch in enumerate(loader):
+            toc = time.time()
+            eta = ((toc - tic) / (i + 1) * (len(loader) - i)) / 3600.0
+            print(f'[{subset}] ËøõÂ∫¶: {i+1}/{len(loader)} | È¢ÑËÆ°Ââ©‰ΩôÊó∂Èó¥ eta:{eta:.5f} Â∞èÊó∂')
